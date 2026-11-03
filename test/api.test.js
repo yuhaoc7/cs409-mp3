@@ -1,0 +1,90 @@
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
+const { app } = require('../server');
+const { mongoose, User, Task } = require('../lib/api');
+let database, server, base;
+before(async () => {
+    database = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+    await mongoose.connect(database.getUri());
+    await Promise.all([User.init(), Task.init()]);
+    server = app.listen(0);
+    base = `http://127.0.0.1:${server.address().port}/api`;
+});
+after(async () => {
+    if (server) await new Promise(resolve => server.close(resolve));
+    await mongoose.disconnect();
+    if (database) await database.stop();
+});
+async function request(method, path, body, status = 200) {
+    const response = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const result = response.status === 204 ? null : await response.json();
+    assert.equal(response.status, status, JSON.stringify(result));
+    if (result) { assert.equal(typeof result.message, 'string'); assert.ok('data' in result); }
+    return result?.data;
+}
+const user = (name, pendingTasks = []) => ({ name, email: `${name}@example.com`, pendingTasks });
+const task = (name, extra = {}) => ({ name, deadline: '2026-12-01', ...extra });
+test('CRUD, replacements, reference moves, completion, renames, deletion', async () => {
+    const a = await request('POST', '/users', user('Alice'), 201);
+    const b = await request('POST', '/users', user('Bob'), 201);
+    const t = await request('POST', '/tasks', task('Work', { assignedUser: a._id }), 201);
+    assert.equal(t.assignedUserName, 'Alice');
+    assert.deepEqual((await request('GET', `/users/${a._id}`)).pendingTasks, [t._id]);
+    await request('PUT', `/users/${b._id}`, user('Bob', [t._id]));
+    assert.deepEqual((await request('GET', `/users/${a._id}`)).pendingTasks, []);
+    assert.equal((await request('GET', `/tasks/${t._id}`)).assignedUser, b._id);
+    await request('PUT', `/tasks/${t._id}`, task('Work', { assignedUser: b._id, completed: true }));
+    assert.deepEqual((await request('GET', `/users/${b._id}`)).pendingTasks, []);
+    const renamed = await request('PUT', `/users/${b._id}`, user('Robert'));
+    assert.equal(renamed.dateCreated, b.dateCreated);
+    assert.equal((await request('GET', `/tasks/${t._id}`)).assignedUserName, 'Robert');
+    await request('PUT', `/tasks/${t._id}`, task('Work', { assignedUser: b._id }));
+    assert.deepEqual((await request('GET', `/users/${b._id}`)).pendingTasks, [t._id]);
+    const replaced = await request('PUT', `/tasks/${t._id}`, task('Replaced'));
+    assert.equal(replaced.dateCreated, t.dateCreated);
+    assert.equal(replaced.assignedUser, '');
+    await request('PUT', `/users/${a._id}`, user('Alice', [t._id]));
+    await request('PUT', `/users/${a._id}`, user('Alice'));
+    assert.equal((await request('GET', `/tasks/${t._id}`)).assignedUser, '');
+    await request('PUT', `/tasks/${t._id}`, task('Done', { assignedUser: b._id, completed: true }));
+    await request('DELETE', `/users/${b._id}`, undefined, 204);
+    assert.equal((await request('GET', `/tasks/${t._id}`)).assignedUserName, 'unassigned');
+    await request('PUT', `/tasks/${t._id}`, task('Pending', { assignedUser: a._id }));
+    await request('DELETE', `/tasks/${t._id}`, undefined, 204);
+    assert.deepEqual((await request('GET', `/users/${a._id}`)).pendingTasks, []);
+    await request('GET', `/tasks/${t._id}`, undefined, 404);
+});
+test('validation precedence and rejected writes preserve data', async () => {
+    const a = await request('POST', '/users', user('Validation'), 201);
+    const t = await request('POST', '/tasks', task('Finished', { completed: true }), 201);
+    await request('PUT', '/users/invalid', {}, 404);
+    await request('PUT', '/tasks/000000000000000000000000', {}, 404);
+    await request('POST', '/users', user('Validation'), 400);
+    await request('POST', '/users', { name: 1, email: 'a' }, 400);
+    await request('POST', '/tasks', task('bad', { completed: 'true' }), 400);
+    await request('POST', '/tasks', task('bad', { assignedUser: 'bad' }), 400);
+    await request('POST', '/tasks', task('bad', { assignedUser: a._id, assignedUserName: 'wrong' }), 400);
+    await request('POST', '/tasks', task('bad', { assignedUser: '000000000000000000000000' }), 404);
+    await request('PUT', `/users/${a._id}`, user('Changed', [t._id]), 400);
+    await request('PUT', `/users/${a._id}`, user('Changed', ['000000000000000000000000']), 404);
+    assert.equal((await request('GET', `/users/${a._id}`)).name, 'Validation');
+    assert.equal((await request('GET', `/tasks/${t._id}`)).assignedUser, '');
+    const response = await fetch(base + '/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{' });
+    assert.equal(response.status, 400);
+    assert.ok('data' in await response.json());
+});
+test('query combinations, projection, counts, defaults and empty results', async () => {
+    await Task.insertMany(Array.from({ length: 105 }, (_, i) => task(`Query${String(i).padStart(3, '0')}`)));
+    const query = params => '?' + new URLSearchParams(Object.entries(params).map(([k, v]) => [k, JSON.stringify(v)]));
+    const where = { name: { $regex: '^Query' } };
+    assert.equal((await request('GET', '/tasks' + query({ where }))).length, 100);
+    const result = await request('GET', '/tasks' + query({ where, sort: { name: -1 }, select: { name: 1, _id: 0 }, skip: 2, limit: 3 }));
+    assert.deepEqual(result, [{ name: 'Query102' }, { name: 'Query101' }, { name: 'Query100' }]);
+    assert.equal(await request('GET', '/tasks' + query({ where, count: true, limit: 1 })), 105);
+    assert.deepEqual(await request('GET', '/users' + query({ where: { name: 'nobody' } })), []);
+    const a = await request('POST', '/users', user('Projection'), 201);
+    assert.deepEqual(await request('GET', `/users/${a._id}` + query({ select: { name: 1, _id: 0 } }) + '&where=bad'), { name: 'Projection' });
+    for (const parameter of ['where', 'sort', 'select', 'skip', 'limit', 'count']) await request('GET', `/tasks?${parameter}=bad`, undefined, 400);
+    await request('GET', '/tasks?skip=-1', undefined, 400);
+});
